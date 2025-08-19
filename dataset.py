@@ -1,0 +1,2 @@
+class CuttingLabel:
+    SHALE = 'shale'
