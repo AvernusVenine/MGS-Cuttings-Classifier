@@ -9,9 +9,7 @@ from torch.nn import CrossEntropyLoss, Linear
 from torchvision.models import resnet50 # Change as needed for testing
 import torchvision.transforms as T
 import ray.tune as tune
-from ray.train import get_checkpoint, Checkpoint
-import ray.cloudpickle as pickle
-from ray import train
+from ray.tune.search.optuna import OptunaSearch
 
 TRAIN_DATA_PATH = 'train_data'
 TEST_DATA_PATH = 'test_data'
@@ -79,7 +77,8 @@ def load_data():
     return train_data, test_data
 
 # Uses ray to hyperparameter train the model on a dictionary of configurations
-def hyperparameter_train(config, max_epochs : int):
+def hyperparameter_train(config):
+    max_epochs = 10
     train_data, _ = load_data()
 
     # Split train data into train/validation subsets
@@ -99,44 +98,15 @@ def hyperparameter_train(config, max_epochs : int):
     loss_func = CrossEntropyLoss()
     optimizer = SGD(model.parameters(), lr=config['lr'], momentum=config['momentum'], weight_decay=config['l2'])
 
-    # Load checkpoint if it exists
-    checkpoint = get_checkpoint()
-    if checkpoint:
-        with checkpoint.as_directory() as checkpoint_dir:
-            path = Path(checkpoint_dir) / "data.pkl"
-
-            with open(path, 'rb') as fp:
-                state = pickle.load(fp)
-
-            start_epoch = state['epoch']
-            model.load_state_dict(state['model_state_dict'])
-            optimizer.load_state_dict(state['optimizer_state_dict'])
-    else:
-        start_epoch = 0
-
-    # Test/validate loop
-    for epoch in range(start_epoch, max_epochs):
+    # Train/validate loop
+    for epoch in range(max_epochs):
         train_loop(train_loader, model, loss_func, optimizer)
         loss, accuracy = test_loop(val_loader, model, loss_func)
 
-        checkpoint_data = {
-            'epoch' : epoch,
-            'model_state_dict' : model.state_dict(),
-            'optimizer_state_dict' : optimizer.state_dict(),
-        }
-        with tempfile.TemporaryDirectory() as checkpoint_dir:
-            path = Path(checkpoint_dir) / 'data.pkl'
+        tune.report({'loss': loss, 'accuracy': accuracy})
 
-            with open(path, 'wb') as fp:
-                pickle.dump(checkpoint_data, fp)
-
-            checkpoint = Checkpoint.from_directory(checkpoint_dir)
-            train.report(
-                {'loss' : loss, 'accuracy' : accuracy},
-                checkpoint=checkpoint
-            )
 # Used to train the model on a single set of parameters
-def  train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-2, momentum : float = 0, l2 = 0):
+def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-2, momentum : float = 0, l2 = 0):
     mean, std = image_preprocessor.compute_mean_and_std(TRAIN_DATA_PATH, [])
 
     train_transform = T.Compose([
@@ -182,11 +152,31 @@ def  train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-2
 
         print(f'Loss: {loss} | Accuracy: {accuracy}')
 
-param_config = {
-    'batch_size' : tune.choice([8, 16, 32, 64]),
-    'lr' : tune.loguniform(1e-4, 1e-1),
-    'momentum' : tune.choice([0, .3, .6, .9]),
-    'l2' : tune.choice([0, 2, 4, 6, 8]),
-}
+def trial_dir_creator(trial):
+    return f'{trial.trainable_name}_{trial.trial_id}'
 
-hyperparameter_train(param_config, 10)
+def tune_model(num_samples : int = 10):
+    config = {
+        'batch_size': tune.choice([8, 16, 32, 64]),
+        'lr': tune.loguniform(1e-4, 1e-1),
+        'momentum': tune.choice([0, .3, .6, .9]),
+        'l2': tune.choice([0, 2, 4, 6, 8]),
+    }
+
+    tuner = tune.Tuner(
+        hyperparameter_train,
+        tune_config=tune.TuneConfig(
+            mode='max',
+            metric='accuracy',
+            search_alg=OptunaSearch(),
+            num_samples=num_samples,
+            trial_dirname_creator=trial_dir_creator,
+        ),
+        param_space=config,
+    )
+
+    results = tuner.fit()
+
+    print(f'Best config: {results.get_best_result().config}')
+
+tune_model()
