@@ -1,6 +1,6 @@
 import tempfile
 from pathlib import Path
-import image_preprocessor, dataset
+import ImagePreprocessor, dataset
 from torch.optim import SGD
 import torch
 from torchvision.datasets import ImageFolder
@@ -10,9 +10,15 @@ from torchvision.models import resnet50 # Change as needed for testing
 import torchvision.transforms as T
 import ray.tune as tune
 from ray.tune.search.optuna import OptunaSearch
+from PIL import Image
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import numpy as np
 
-TRAIN_DATA_PATH = 'train_data'
-TEST_DATA_PATH = 'test_data'
+from dataset import CuttingLabel
+import DetectionModel
+
+DATA_PATH = 'grain_data'
 
 def train_loop(dataloader, model, loss_func, optimizer):
     model.train()
@@ -47,32 +53,20 @@ def test_loop(dataloader, model, loss_func):
 
 # Load data into two sets, test and train
 def load_data():
-    mean, std = image_preprocessor.compute_mean_and_std(TRAIN_DATA_PATH, [])
+    mean, std = (0.4435, 0.4484, 0.4092), (0.1288, 0.1286, 0.1236)
 
-    train_transform = T.Compose([
-        T.Resize(256),
-        T.RandomCrop(224),
-        T.ToTensor(),
-        T.Normalize(mean=mean, std=std),
-        T.RandomApply([
-            T.RandomPerspective(),
-            T.RandomRotation(degrees=(0, 360)),
-            T.RandomAdjustSharpness(sharpness_factor=2),
-            T.RandomAutocontrast(),
-            T.RandomHorizontalFlip(),
-            T.RandomVerticalFlip(),
-        ], p=0.5)
+    transform = A.Compose([
+        A.Resize(128, 128),
+        A.Normalize(mean=mean, std=std),
+        T.ColorJitter(brightness=.1, contrast=.1),
+        A.HorizontalFlip(p=.5),
+        A.VerticalFlip(p=.5),
+        ToTensorV2
     ])
 
-    test_transform = T.Compose([
-        T.Resize(256),
-        T.CenterCrop(224),
-        T.ToTensor(),
-        T.Normalize(mean=mean, std=std),
-    ])
+    data = ImageFolder(root=f'{DATA_PATH}/', transform=transform)
 
-    train_data = ImageFolder(root=f'{TRAIN_DATA_PATH}/', transform=train_transform)
-    test_data = ImageFolder(root=f'{TEST_DATA_PATH}/', transform=test_transform)
+    train_data, test_data = random_split(data, [.8, .2])
 
     return train_data, test_data
 
@@ -106,33 +100,21 @@ def hyperparameter_train(config):
         tune.report({'loss': loss, 'accuracy': accuracy})
 
 # Used to train the model on a single set of parameters
-def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-2, momentum : float = 0, l2 = 0):
-    mean, std = image_preprocessor.compute_mean_and_std(TRAIN_DATA_PATH, [])
+def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-3, momentum : float = 0.9, l2 = 0):
+    mean, std = (0.4435, 0.4484, 0.4092), (0.1288, 0.1286, 0.1236)
 
-    train_transform = T.Compose([
-        T.Resize(256),
-        T.RandomCrop(224),
-        T.ToTensor(),
-        T.Normalize(mean=mean, std=std),
-        T.RandomApply([
-            T.RandomPerspective(),
-            T.RandomRotation(degrees=(0, 360)),
-            T.RandomAdjustSharpness(sharpness_factor=2),
-            T.RandomAutocontrast(),
-            T.RandomHorizontalFlip(),
-            T.RandomVerticalFlip(),
-        ], p=0.5)
+    transform = A.Compose([
+        A.Resize(224, 224),
+        A.Normalize(mean=mean, std=std),
+        A.ColorJitter(brightness=.1, contrast=.1),
+        A.HorizontalFlip(p=.5),
+        A.VerticalFlip(p=.5),
+        ToTensorV2()
     ])
 
-    test_transform = T.Compose([
-        T.Resize(256),
-        T.CenterCrop(224),
-        T.ToTensor(),
-        T.Normalize(mean=mean, std=std),
-    ])
+    data = ImageFolder(root=f'{DATA_PATH}/', transform=lambda img: transform(image=np.array(img))["image"])
 
-    train_data = ImageFolder(root=f'{TRAIN_DATA_PATH}/', transform=train_transform)
-    test_data = ImageFolder(root=f'{TEST_DATA_PATH}/', transform=test_transform)
+    train_data, test_data = random_split(data, [.8, .2])
 
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
@@ -140,10 +122,15 @@ def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-2,
     model = resnet50()
 
     n_features = model.fc.in_features
-    model.fc = Linear(n_features, len(train_data.classes))
+    model.fc = Linear(n_features, 2)
+    model.load_state_dict(torch.load('trained_classification_model.pth'))
 
     loss_func = CrossEntropyLoss()
     optimizer = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=l2)
+
+    best_loss = float('inf')
+    patience = 10
+    triggers = 0
 
     for epoch in range(max_epochs):
         print(f'Epoch {epoch + 1}')
@@ -152,6 +139,18 @@ def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-2,
 
         print(f'Loss: {loss} | Accuracy: {accuracy}')
 
+        if loss < best_loss:
+            best_loss = loss
+            triggers = 0
+
+            torch.save(model.state_dict(), 'trained_model.pth')
+        else:
+            triggers += 1
+
+            if triggers >= patience:
+                print(f'No improvement for {patience} epochs.  Stopping early with {best_loss}')
+                break
+
 def trial_dir_creator(trial):
     return f'{trial.trainable_name}_{trial.trial_id}'
 
@@ -159,7 +158,7 @@ def tune_model(num_samples : int = 10):
     config = {
         'batch_size': tune.choice([8, 16, 32, 64]),
         'lr': tune.loguniform(1e-4, 1e-1),
-        'momentum': tune.choice([0, .3, .6, .9]),
+        'momentum': tune.uniform(0, .9),
         'l2': tune.choice([0, 2, 4, 6, 8]),
     }
 
@@ -179,4 +178,4 @@ def tune_model(num_samples : int = 10):
 
     print(f'Best config: {results.get_best_result().config}')
 
-tune_model()
+train_model(max_epochs=300)
