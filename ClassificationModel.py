@@ -14,11 +14,33 @@ from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
+import torch.nn as nn
 
-from dataset import CuttingLabel
-import DetectionModel
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ConvBlock, self).__init__()
 
-DATA_PATH = 'grain_data'
+        self.conv2d = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.batchNorm2d = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.conv2d(x)
+        x = self.batchNorm2d(x)
+        x = self.relu(x)
+        return x
+
+class ClassificationCNN(nn.Module):
+    def __init__(self, n_classes=2):
+        super(ClassificationCNN, self).__init__()
+
+        self.convBlock1 = ConvBlock(in_channels=3, out_channels=64, kernel_size=9, stride=1, padding=0)
+        self.maxPool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Inception Layer 1
+        #self.
+
+        self.dense = nn.LazyLinear(out_features=n_classes)
 
 def train_loop(dataloader, model, loss_func, optimizer):
     model.train()
@@ -51,55 +73,6 @@ def test_loop(dataloader, model, loss_func):
     print(f'Accuracy: {100 * accuracy} | Test Loss: {test_loss}')
     return test_loss, accuracy
 
-# Load data into two sets, test and train
-def load_data():
-    mean, std = (0.4435, 0.4484, 0.4092), (0.1288, 0.1286, 0.1236)
-
-    transform = A.Compose([
-        A.Resize(128, 128),
-        A.Normalize(mean=mean, std=std),
-        T.ColorJitter(brightness=.1, contrast=.1),
-        A.HorizontalFlip(p=.5),
-        A.VerticalFlip(p=.5),
-        ToTensorV2
-    ])
-
-    data = ImageFolder(root=f'{DATA_PATH}/', transform=transform)
-
-    train_data, test_data = random_split(data, [.8, .2])
-
-    return train_data, test_data
-
-# Uses ray to hyperparameter train the model on a dictionary of configurations
-def hyperparameter_train(config):
-    max_epochs = 10
-    train_data, _ = load_data()
-
-    # Split train data into train/validation subsets
-    split = int(len(train_data) * .85)
-    train_subset, val_subset = random_split(
-        train_data, [split, len(train_data) - split]
-    )
-
-    train_loader = DataLoader(train_subset, batch_size=config['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_subset, batch_size=config['batch_size'], shuffle=True)
-
-    model = resnet50()
-
-    n_features = model.fc.in_features
-    model.fc = Linear(n_features, len(train_data.classes))
-
-    loss_func = CrossEntropyLoss()
-    optimizer = SGD(model.parameters(), lr=config['lr'], momentum=config['momentum'], weight_decay=config['l2'])
-
-    # Train/validate loop
-    for epoch in range(max_epochs):
-        train_loop(train_loader, model, loss_func, optimizer)
-        loss, accuracy = test_loop(val_loader, model, loss_func)
-
-        tune.report({'loss': loss, 'accuracy': accuracy})
-
-# Used to train the model on a single set of parameters
 def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-4, momentum : float = 0.9, l2 = 0):
     mean, std = (0.4435, 0.4484, 0.4092), (0.1288, 0.1286, 0.1236)
 
@@ -112,7 +85,7 @@ def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-4,
         ToTensorV2()
     ])
 
-    data = ImageFolder(root=f'{DATA_PATH}/', transform=lambda img: transform(image=np.array(img))["image"])
+    data = ImageFolder(root=f'grain_data/', transform=lambda img: transform(image=np.array(img))["image"])
 
     train_data, test_data = random_split(data, [.8, .2])
 
@@ -150,33 +123,3 @@ def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-4,
             if triggers >= patience:
                 print(f'No improvement for {patience} epochs.  Stopping early with {best_loss}')
                 break
-
-def trial_dir_creator(trial):
-    return f'{trial.trainable_name}_{trial.trial_id}'
-
-def tune_model(num_samples : int = 10):
-    config = {
-        'batch_size': tune.choice([8, 16, 32, 64]),
-        'lr': tune.loguniform(1e-4, 1e-1),
-        'momentum': tune.uniform(0, .9),
-        'l2': tune.choice([0, 2, 4, 6, 8]),
-    }
-
-    tuner = tune.Tuner(
-        hyperparameter_train,
-        tune_config=tune.TuneConfig(
-            mode='max',
-            metric='accuracy',
-            search_alg=OptunaSearch(),
-            num_samples=num_samples,
-            trial_dirname_creator=trial_dir_creator,
-        ),
-        param_space=config,
-    )
-
-    results = tuner.fit()
-
-    print(f'Best config: {results.get_best_result().config}')
-
-DetectionModel.train_model(max_epochs=300, batch_size=128)
-train_model(max_epochs=100)
