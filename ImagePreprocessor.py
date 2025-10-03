@@ -9,7 +9,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-from dataset import CuttingLabel
+from dataset import GrainLabel
 
 # Finds the mean and std of the data set for normalization
 def compute_mean_and_std(path : str, labels = None):

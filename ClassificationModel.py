@@ -1,12 +1,11 @@
-import tempfile
-from pathlib import Path
-import ImagePreprocessor, dataset
+import os
 from torch.optim import SGD
 import torch
 from torchvision.datasets import ImageFolder
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Dataset
 from torch.nn import CrossEntropyLoss, Linear
-from torchvision.models import resnet50 # Change as needed for testing
+import torch.nn.functional as F
+from torchvision.models import resnet50, resnet18
 import torchvision.transforms as T
 import ray.tune as tune
 from ray.tune.search.optuna import OptunaSearch
@@ -16,31 +15,130 @@ from albumentations.pytorch import ToTensorV2
 import numpy as np
 import torch.nn as nn
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
-        super(ConvBlock, self).__init__()
+class GrainDataset(Dataset):
+    def __init__(self, root_dir, transform):
+        self.root_dir = root_dir
+        self.transform = transform
 
-        self.conv2d = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
-        self.batchNorm2d = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU()
+        self.samples = []
+
+
+    def __getitem__(self, idx):
+
+        pass
+
+
+class ClassificationModel(nn.Module):
+    def __init__(self, in_features):
+        super(ClassificationModel, self).__init__()
+
+        model = resnet18()
+        self.backbone = nn.Sequential(*list(model.children())[:-1])
+        self.flatten = nn.Flatten()
+
+        self.age = nn.Linear(in_features, 4) # Precambrian, Paleozoic, Cretaceous, Other
+
+        self.other_type = nn.Linear(in_features, 4) # Chert, Unknown, Secondary, Gypsum
+
+        self.cretaceous_type = nn.Linear(in_features, 2) # Shale, Non-Shale
+        self.shale_type = nn.Linear(in_features, 2) # Gray Shale, Speckled Shale
+        self.cretaceous_other_type = nn.Linear(in_features, 7)
+
+        self.paleozoic_type = nn.Linear(in_features, 2) # Carbonate, Sandstone Shale
+
+        self.precambrian_type = nn.Linear(in_features, 2) # Crystalline, Other
+        self.crystalline_type = nn.Linear(in_features, 3) # Light, Dark, Red
+        self.light_type = nn.Linear(in_features, 3)
+        self.dark_type = nn.Linear(in_features, 2)
+        self.red_type = nn.Linear(in_features, 4)
 
     def forward(self, x):
-        x = self.conv2d(x)
-        x = self.batchNorm2d(x)
-        x = self.relu(x)
-        return x
+        x = self.backbone(x)
+        x = self.flatten(x)
 
-class ClassificationCNN(nn.Module):
-    def __init__(self, n_classes=2):
-        super(ClassificationCNN, self).__init__()
+        return {
+            'age' : self.age(x),
+            'other_type' : self.other_type(x),
+            'cretaceous_type' : self.cretaceous_type(x),
+            'shale_type' : self.shale_type(x),
+            'cretaceous_other_type' : self.cretaceous_other_type(x),
+            'paleozoic_type' : self.paleozoic_type(x),
+            'precambrian_type' : self.precambrian_type(x),
+            'crystalline_type' : self.crystalline_type(x),
+            'light_type' : self.light_type(x),
+            'dark_type' : self.dark_type(x),
+            'red_type' : self.red_type(x)
+        }
 
-        self.convBlock1 = ConvBlock(in_channels=3, out_channels=64, kernel_size=9, stride=1, padding=0)
-        self.maxPool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+def compute_loss(outputs, targets):
+    loss = 0
 
-        # Inception Layer 1
-        #self.
+    age = targets['age']
 
-        self.dense = nn.LazyLinear(out_features=n_classes)
+    age_loss = F.cross_entropy(outputs['age'], targets['age'])
+    loss += age_loss
+
+    # Other Grains Loss
+    other_mask = (age == 0)
+    if other_mask.any():
+        loss += F.cross_entropy(outputs['other_type'][other_mask],
+                                targets['other_type'][other_mask])
+
+    # Cretaceous Grains Loss
+    cretaceous_mask = (age == 1)
+    if cretaceous_mask.any():
+        cretaceous_type = targets['cretaceous_type'][cretaceous_mask]
+
+        loss += F.cross_entropy(outputs['cretaceous_type'][cretaceous_mask],
+                                targets['cretaceous_type'][cretaceous_mask])
+
+        shale_mask = (cretaceous_type == 0)
+        if shale_mask.any():
+            loss += F.cross_entropy(outputs['shale_type'][shale_mask],
+                                    targets['shale_type'][shale_mask])
+
+        cretaceous_other_mask = (cretaceous_type == 1)
+        if cretaceous_other_mask.any():
+            loss += F.cross_entropy(outputs['cretaceous_other_type'][cretaceous_other_mask],
+                                    targets['cretaceous_other_type'][cretaceous_other_mask])
+
+    # Paleozoic Grains Loss
+    paleozoic_mask = (age == 2)
+    if paleozoic_mask.any():
+        loss += F.cross_entropy(outputs['paleozoic_type'][paleozoic_mask],
+                                targets['paleozoic_type'][paleozoic_mask])
+
+    # Precambrian Grains Loss
+    precambrian_mask = (age == 3)
+    if precambrian_mask.any():
+        precambrian_type = targets['precambrian_type'][precambrian_mask]
+
+        loss += F.cross_entropy(outputs['precambrian_type'][precambrian_mask],
+                                targets['precambrian_type'][precambrian_mask])
+
+        crystalline_mask = (precambrian_type == 0)
+        if crystalline_mask.any():
+            crystalline_type = targets['crystalline_type'][crystalline_mask]
+
+            loss += F.cross_entropy(outputs['crystalline_type'][crystalline_mask],
+                                    targets['crystalline_type'][crystalline_mask])
+
+            light_mask = (crystalline_type == 0)
+            if light_mask.any():
+                loss += F.cross_entropy(outputs['light_type'][light_mask],
+                                        targets['light_type'][light_mask])
+
+            dark_mask = (crystalline_type == 1)
+            if dark_mask.any():
+                loss += F.cross_entropy(outputs['dark_type'][dark_mask],
+                                        targets['dark_type'][dark_mask])
+
+            red_mask = (crystalline_type == 2)
+            if red_mask.any():
+                loss += F.cross_entropy(outputs['red_type'][red_mask],
+                                        targets['red_type'][red_mask])
+
+    return loss
 
 def train_loop(dataloader, model, loss_func, optimizer):
     model.train()
@@ -72,6 +170,11 @@ def test_loop(dataloader, model, loss_func):
 
     print(f'Accuracy: {100 * accuracy} | Test Loss: {test_loss}')
     return test_loss, accuracy
+
+def load_model(path : str = None):
+    model = resnet18(pretrained=False)
+
+    pass
 
 def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-4, momentum : float = 0.9, l2 = 0):
     mean, std = (0.4435, 0.4484, 0.4092), (0.1288, 0.1286, 0.1236)

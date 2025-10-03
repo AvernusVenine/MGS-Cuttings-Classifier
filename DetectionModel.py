@@ -3,6 +3,8 @@ from pathlib import Path
 from turtledemo.chaos import coosys
 
 import numpy as np
+from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 import ImagePreprocessor, dataset
 import xml.etree.ElementTree as ET
@@ -14,10 +16,11 @@ import matplotlib.pyplot as plt
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.nn as nn
+import time
 
 import cv2
 
-from dataset import CuttingLabel
+from dataset import GrainLabel
 
 DATA_PATH = 'annotated_data'
 
@@ -523,14 +526,18 @@ def train_model(max_epochs : int = 10, batch_size : int = 32, lr : float = 1e-5,
 def test_model():
     mean, std = 0.45, 0.12
 
-    model = DetectionCNN()
-    model.load_state_dict(torch.load('trained_detection_model_custom.pth'))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model.train()
+    detection_model = fasterrcnn_resnet50_fpn_v2()
+    in_features = detection_model.roi_heads.box_predictor.cls_score.in_features
+    detection_model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes=2)
+    detection_model.load_state_dict(torch.load('trained_detection_model_cnn.pth', map_location=device))
+
+    detection_model.eval()
 
     transform = A.Compose([
         A.Resize(128, 128),
-        A.ToGray(num_output_channels=1),
+        A.ToGray(num_output_channels=3),
         A.Normalize(mean=mean, std=std),
         ToTensorV2()
     ])
@@ -540,20 +547,13 @@ def test_model():
 
     img = transform(image=img)['image']
 
-    if img.shape[0] != 1:
-        img = img[:1, :, :]
-
     torch.set_printoptions(threshold=float('inf'))
 
-    hm, _, _ = model(img.unsqueeze(0))
+    start = time.time()
 
-    heatmap_np = hm[0, 0].cpu().detach().numpy()
+    detection_model(img.unsqueeze(0))
 
-    # Plot using matplotlib
-    plt.imshow(heatmap_np, cmap='hot', interpolation='nearest')
-    plt.colorbar()
-    plt.axis('off')
-    plt.show()
+    print(time.time() - start)
 
 
 def visualize_layer():
@@ -568,5 +568,5 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 #visualize_layer()
-train_model(max_epochs=250, batch_size=256, lr=1e-4)
+#train_model(max_epochs=150, batch_size=256, lr=1e-5)
 #test_model()

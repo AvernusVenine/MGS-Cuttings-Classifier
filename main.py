@@ -1,5 +1,7 @@
 import tempfile
 from pathlib import Path
+
+import FasterRCNNModel
 import ImagePreprocessor, dataset
 from torch.optim import SGD
 import torch
@@ -15,7 +17,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
 
-from dataset import CuttingLabel
+from dataset import GrainLabel
 import DetectionModel
 
 DATA_PATH = 'grain_data'
@@ -178,5 +180,4 @@ def tune_model(num_samples : int = 10):
 
     print(f'Best config: {results.get_best_result().config}')
 
-DetectionModel.train_model(max_epochs=300, batch_size=128)
-train_model(max_epochs=100)
+FasterRCNNModel.train_model(max_epochs=200, batch_size=16)
