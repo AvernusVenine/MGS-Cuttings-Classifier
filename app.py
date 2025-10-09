@@ -20,6 +20,7 @@ from PyQt6.QtGui import QAction, QIcon, QKeySequence, QImage, QPixmap, QPainter,
 from pygrabber.dshow_graph import FilterGraph
 import torch.nn.functional as F
 
+import ClassificationModel
 import FasterRCNNModel
 from DetectionModel import DetectionCNN
 import dataset
@@ -119,10 +120,11 @@ class ClassifierWorker(QObject):
                     y2 *= scale_y
 
                     label, confidence = self.model_classify(qt_image, x1, y1, x2, y2)
+                    label, confidence = dataset.targets_to_label(label, confidence)
 
                     labels.append({
-                        'label': str(label),
-                        'confidence': float(confidence),
+                        'label': label,
+                        'confidence': confidence,
                         'box': [int(x1), int(y1), int(x2), int(y2)]
                     })
 
@@ -130,7 +132,7 @@ class ClassifierWorker(QObject):
             QCoreApplication.processEvents()
 
     def model_classify(self, image : QImage, x1, y1, x2, y2):
-        mean, std = (0.4435, 0.4484, 0.4092), (0.1288, 0.1286, 0.1236)
+        mean, std = 0.45, 0.12
 
         image = image.convertToFormat(QImage.Format.Format_RGB888)
         width = image.width()
@@ -143,7 +145,7 @@ class ClassifierWorker(QObject):
         cropped = arr[int(y1):int(y2), int(x1):int(x2)]
 
         transform = A.Compose([
-            A.Resize(128, 128),
+            A.Resize(256, 256),
             A.Normalize(mean=mean, std=std),
             ToTensorV2()
         ])
@@ -155,10 +157,18 @@ class ClassifierWorker(QObject):
         with torch.no_grad():
             prediction = self.classifier_model(X.unsqueeze(0))
 
-        label = prediction.argmax(dim=1).item()
-        confidence = F.softmax(prediction, dim=1)[0, label].item()
+        label = {}
+        confidence = {}
 
-        return dataset.CLASS_MAP[label], confidence
+        for key, logits in prediction.items():
+            probs = F.softmax(logits, dim=1)
+            pred = torch.argmax(probs, dim=1)
+            conf = probs[0, pred.item()]
+
+            label[key] = pred.item()
+            confidence[key] = conf.item()
+
+        return label, confidence
 
     def model_detect(self, image : QImage):
         mean, std = 0.45, 0.12
@@ -173,7 +183,6 @@ class ClassifierWorker(QObject):
 
         transform = A.Compose([
             A.Resize(256, 256),
-            #A.ToGray(num_output_channels=3),
             A.Normalize(mean=mean, std=std),
             ToTensorV2()
         ])
@@ -188,7 +197,6 @@ class ClassifierWorker(QObject):
             prediction = self.detection_model(X)
 
         return prediction
-
 
 class CameraWorker(QObject):
     frame_ready = pyqtSignal(QImage)
@@ -245,7 +253,7 @@ class CameraWorker(QObject):
 
                 classification = label['label']
 
-                pen.setColor(QColor(self.label_colors[classification]))
+                #pen.setColor(QColor(self.label_colors[classification]))
                 painter.setPen(pen)
 
                 painter.drawRect(int(x1), int(y1), int(x2 - x1), int(y2 - y1))
@@ -323,14 +331,11 @@ class AppWindow(QMainWindow):
 def run():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    detection_model = FasterRCNNModel.load_model(path='FasterrCNN_128_128.pth')
+    detection_model = FasterRCNNModel.load_model(path='Trained Models/FasterRCNN_256_256.pth')
     detection_model.to(device)
     detection_model.eval()
 
-    classifier_model = resnet50()
-    in_features = classifier_model.fc.in_features
-    classifier_model.fc = Linear(in_features, 2) # TODO: Change to number of final classes
-    classifier_model.load_state_dict(torch.load('trained_classification_model.pth', map_location=device))
+    classifier_model = ClassificationModel.load_model(path='Classifier_50.pth')
     classifier_model.to(device)
     classifier_model.eval()
 

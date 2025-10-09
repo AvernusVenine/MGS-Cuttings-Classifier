@@ -20,7 +20,7 @@ class DetectionDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
 
-        self.img_files = [f for f in os.listdir(root_dir) if f.endswith('.jpg')]
+        self.img_files = [f for f in os.listdir(root_dir) if f.endswith(('.jpg', '.bmp'))]
 
     def __len__(self):
         return len(self.img_files)
@@ -28,7 +28,7 @@ class DetectionDataset(Dataset):
     def __getitem__(self, idx):
         img_filename = self.img_files[idx]
         img_path = os.path.join(self.root_dir, img_filename)
-        xml_path = img_path.replace('.jpg', '.xml')
+        xml_path = img_path.replace('.jpg', '.xml').replace('.bmp', '.xml')
 
         img = cv2.imread(img_path)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -134,7 +134,6 @@ def train_model(max_epochs : int = 10, batch_size : int = 32, lr : float = 1e-5,
     mean, std = 0.45, 0.12
 
     transform = A.Compose([
-        #A.ToGray(num_output_channels=3),
         A.Resize(256, 256),
         A.ColorJitter(brightness=.1, contrast=.1),
         A.Affine(translate_percent={'x': (-.25, .25), 'y': (-.25, .25)}),
@@ -179,7 +178,7 @@ def train_model(max_epochs : int = 10, batch_size : int = 32, lr : float = 1e-5,
             best_loss = loss
             triggers = 0
 
-            torch.save(model.state_dict(), 'FasterrCNN_128_128.pth')
+            torch.save(model.state_dict(), 'FasterrCNN_256_256.pth')
         else:
             triggers += 1
 

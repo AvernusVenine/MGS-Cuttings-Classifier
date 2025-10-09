@@ -19,6 +19,7 @@ import numpy as np
 
 from dataset import GrainLabel
 import DetectionModel
+import ClassificationModel
 
 DATA_PATH = 'grain_data'
 
@@ -180,4 +181,5 @@ def tune_model(num_samples : int = 10):
 
     print(f'Best config: {results.get_best_result().config}')
 
-FasterRCNNModel.train_model(max_epochs=200, batch_size=16)
+ClassificationModel.train_model(max_epochs=200, batch_size=128)
+#FasterRCNNModel.train_model(max_epochs=200, batch_size=16)

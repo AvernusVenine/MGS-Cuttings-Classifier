@@ -10,6 +10,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from dataset import GrainLabel
+import FasterRCNNModel
 
 # Finds the mean and std of the data set for normalization
 def compute_mean_and_std(path : str, labels = None):
@@ -69,17 +70,16 @@ def preprocess_dataset(data_path : str, save_path : str, label : str, file_type 
             idx += 1
 
 def separate_grains(data_path : str, save_path : str, label : str, file_type : str):
-    images = Path(f'{data_path}/{label}').glob(f'**/*{file_type}')
+    images = Path(f'{data_path}').glob(f'**/*{file_type}')
 
-    model = fasterrcnn_resnet50_fpn_v2()
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes=2)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model.load_state_dict(torch.load('trained_detection_model_temp.pth'))
+    model = FasterRCNNModel.load_model('Trained Models/FasterRCNN_256_256.pth')
+    model.to(device)
     model.eval()
 
-    threshold = .6
-    mean, std = (0.4435, 0.4484, 0.4092), (0.1288, 0.1286, 0.1236)
+    threshold = .5
+    mean, std = 0.45, 0.12
 
     count = 0
 
@@ -91,42 +91,41 @@ def separate_grains(data_path : str, save_path : str, label : str, file_type : s
         arr = np.array(image)
 
         transform = A.Compose([
-            A.Resize(256, 512),
-            A.ToGray(num_output_channels=3),
+            A.Resize(256, 256),
             A.Normalize(mean=mean, std=std),
             ToTensorV2()
         ])
 
         X = transform(image=arr)['image']
 
+        X = X.unsqueeze(0)
+        X = X.to(device)
+
         model.eval()
         with torch.no_grad():
-            prediction = model([X])[0]
+            detections = model(X)
 
         w, h = image.size
 
-        resize_w, resize_h = 512, 256
+        resize_w, resize_h = 256, 256
         scale_x = w / resize_w
         scale_y = h / resize_h
 
-        boxes = prediction['boxes'].cpu().numpy()
-        scores = prediction['scores'].cpu().numpy()
+        scores = detections[0]['scores'].cpu().numpy().tolist()
+        boxes = detections[0]['boxes'].cpu().numpy().tolist()
 
-        for idx, box in enumerate(boxes):
+        for box, score in zip(boxes, scores):
+            if score > threshold:
+                x1, y1, x2, y2 = box[0:4]
 
-            if scores[idx] < threshold:
-                continue
+                x1 *= scale_x
+                y1 *= scale_y
+                x2 *= scale_x
+                y2 *= scale_y
 
-            x1, y1, x2, y2 = map(float, box)
+                cropped = image.crop((int(x1), int(y1), int(x2), int(y2)))
+                cropped.save(f'{save_path}/{label}/{label}_{count}.jpg')
 
-            x1 *= scale_x
-            y1 *= scale_y
-            x2 *= scale_x
-            y2 *= scale_y
+                count += 1
 
-            cropped = image.crop((int(x1), int(y1), int(x2), int(y2)))
-            cropped.save(f'{save_path}/{label}/{label}_{count}.jpg')
-
-            count += 1
-
-#separate_grains('raw_images', 'grain_data', CuttingLabel.SHALE, '.jpg')
+#separate_grains('raw_white_pics/Gypsum', 'grain_data/other', 'gypsum', '.bmp')

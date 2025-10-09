@@ -1,11 +1,11 @@
 import os
-from torch.optim import SGD
+import cv2
 import torch
-from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader, random_split, Dataset
 from torch.nn import CrossEntropyLoss, Linear
 import torch.nn.functional as F
-from torchvision.models import resnet50, resnet18
+from torchvision.models import resnet50, resnet18, resnet34
+from torch.optim import Adam
 import torchvision.transforms as T
 import ray.tune as tune
 from ray.tune.search.optuna import OptunaSearch
@@ -15,42 +15,61 @@ from albumentations.pytorch import ToTensorV2
 import numpy as np
 import torch.nn as nn
 
+import dataset
+
+
 class GrainDataset(Dataset):
     def __init__(self, root_dir, transform):
         self.root_dir = root_dir
         self.transform = transform
 
-        self.samples = []
+        self.img_files = [
+            os.path.join(dirpath, filename)
+            for dirpath, _, filenames in os.walk(root_dir)
+            for filename in filenames
+            if filename.lower().endswith(('.jpg', '.bmp', '.png', '.jpeg'))
+        ]
 
+    def __len__(self):
+        return len(self.img_files)
 
     def __getitem__(self, idx):
+        img_path = self.img_files[idx]
+        basename = os.path.basename(os.path.dirname(img_path))
 
-        pass
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+        transformed = self.transform(image=img)
+        img = transformed['image']
+
+        target = dataset.GRAIN_MAP[basename].get_target()
+
+        return img, target
 
 class ClassificationModel(nn.Module):
-    def __init__(self, in_features):
+    def __init__(self):
         super(ClassificationModel, self).__init__()
 
-        model = resnet18()
+        model = resnet50()
         self.backbone = nn.Sequential(*list(model.children())[:-1])
         self.flatten = nn.Flatten()
 
-        self.age = nn.Linear(in_features, 4) # Precambrian, Paleozoic, Cretaceous, Other
+        self.age = nn.LazyLinear(4) # Precambrian, Paleozoic, Cretaceous, Other
 
-        self.other_type = nn.Linear(in_features, 4) # Chert, Unknown, Secondary, Gypsum
+        self.other_type = nn.LazyLinear(4) # Chert, Unknown, Secondary, Gypsum
 
-        self.cretaceous_type = nn.Linear(in_features, 2) # Shale, Non-Shale
-        self.shale_type = nn.Linear(in_features, 2) # Gray Shale, Speckled Shale
-        self.cretaceous_other_type = nn.Linear(in_features, 7)
+        self.cretaceous_type = nn.LazyLinear(2) # Shale, Non-Shale
+        self.shale_type = nn.LazyLinear(2) # Gray Shale, Speckled Shale
+        self.cretaceous_other_type = nn.LazyLinear(6)
 
-        self.paleozoic_type = nn.Linear(in_features, 2) # Carbonate, Sandstone Shale
+        self.paleozoic_type = nn.LazyLinear(2) # Carbonate, Sandstone Shale
 
-        self.precambrian_type = nn.Linear(in_features, 2) # Crystalline, Other
-        self.crystalline_type = nn.Linear(in_features, 3) # Light, Dark, Red
-        self.light_type = nn.Linear(in_features, 3)
-        self.dark_type = nn.Linear(in_features, 2)
-        self.red_type = nn.Linear(in_features, 4)
+        self.precambrian_type = nn.LazyLinear(2) # Crystalline, Other
+        self.crystalline_type = nn.LazyLinear(3) # Light, Dark, Red
+        self.light_type = nn.LazyLinear(3)
+        self.dark_type = nn.LazyLinear(2)
+        self.red_type = nn.LazyLinear(4)
 
     def forward(self, x):
         x = self.backbone(x)
@@ -70,7 +89,18 @@ class ClassificationModel(nn.Module):
             'red_type' : self.red_type(x)
         }
 
-def compute_loss(outputs, targets):
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+def compute_loss(outputs, targets, device):
+    keys = targets[0].keys()
+    batch_targets = {}
+
+    for key in keys:
+        batch_targets[key] = torch.stack([t[key] for t in targets]).to(device)
+
+    targets = batch_targets
+
     loss = 0
 
     age = targets['age']
@@ -87,12 +117,11 @@ def compute_loss(outputs, targets):
     # Cretaceous Grains Loss
     cretaceous_mask = (age == 1)
     if cretaceous_mask.any():
-        cretaceous_type = targets['cretaceous_type'][cretaceous_mask]
-
         loss += F.cross_entropy(outputs['cretaceous_type'][cretaceous_mask],
                                 targets['cretaceous_type'][cretaceous_mask])
 
-        shale_mask = (cretaceous_type == 0)
+        cretaceous_type = targets['cretaceous_type']
+        shale_mask = (cretaceous_type == 0) & cretaceous_type
         if shale_mask.any():
             loss += F.cross_entropy(outputs['shale_type'][shale_mask],
                                     targets['shale_type'][shale_mask])
@@ -111,12 +140,11 @@ def compute_loss(outputs, targets):
     # Precambrian Grains Loss
     precambrian_mask = (age == 3)
     if precambrian_mask.any():
-        precambrian_type = targets['precambrian_type'][precambrian_mask]
-
         loss += F.cross_entropy(outputs['precambrian_type'][precambrian_mask],
                                 targets['precambrian_type'][precambrian_mask])
 
-        crystalline_mask = (precambrian_type == 0)
+        precambrian_type = targets['precambrian_type']
+        crystalline_mask = (precambrian_type == 0) & precambrian_type
         if crystalline_mask.any():
             crystalline_type = targets['crystalline_type'][crystalline_mask]
 
@@ -140,86 +168,89 @@ def compute_loss(outputs, targets):
 
     return loss
 
-def train_loop(dataloader, model, loss_func, optimizer):
+def train_loop(dataloader, model, optimizer, device):
     model.train()
 
-    for _, (X, y) in enumerate(dataloader):
+    for images, targets in dataloader:
+        images = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
         # Forward Propagation
-        pred = model(X)
-        loss = loss_func(pred, y)
+        output = model(torch.stack(images, dim=0))
+        loss = compute_loss(output, targets, device)
 
         #Backward Propagation
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
-def test_loop(dataloader, model, loss_func):
+def test_loop(dataloader, model, device):
     model.eval()
 
     test_loss = 0
-    accuracy = 0
 
     with torch.no_grad():
-        for X, y in dataloader:
-            pred = model(X)
-            test_loss += loss_func(pred, y).item()
-            accuracy += (pred.argmax(1) == y).type(torch.float).sum().item()
+        for images, targets in dataloader:
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            output = model(torch.stack(images, dim=0))
+            test_loss += compute_loss(output, targets, device)
 
     test_loss = test_loss / len(dataloader)
-    accuracy = accuracy / len(dataloader.dataset)
 
-    print(f'Accuracy: {100 * accuracy} | Test Loss: {test_loss}')
-    return test_loss, accuracy
+    print(f'Loss: {test_loss}')
+    return test_loss
 
 def load_model(path : str = None):
-    model = resnet18(pretrained=False)
+    model = ClassificationModel()
 
-    pass
+    if path:
+        model.load_state_dict(torch.load(path))
 
-def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-4, momentum : float = 0.9, l2 = 0):
-    mean, std = (0.4435, 0.4484, 0.4092), (0.1288, 0.1286, 0.1236)
+    return model
+
+def train_model(max_epochs : int = 10, batch_size : int = 64, lr : float = 1e-4, l2 = 0):
+    mean, std = 0.45, 0.12
 
     transform = A.Compose([
-        A.Resize(224, 224),
+        A.Resize(256, 256),
         A.Normalize(mean=mean, std=std),
-        A.ColorJitter(brightness=.1, contrast=.1),
+        A.RandomBrightnessContrast(brightness_limit=(-.2, .2), contrast_limit=(-.2, .2), p=.75),
         A.HorizontalFlip(p=.5),
         A.VerticalFlip(p=.5),
+        A.Affine(rotate=(-45, 45), shear=(-10, 10), p=.75),
         ToTensorV2()
     ])
 
-    data = ImageFolder(root=f'grain_data/', transform=lambda img: transform(image=np.array(img))["image"])
+    data = GrainDataset(root_dir=f'grain_data/', transform=transform)
 
-    train_data, test_data = random_split(data, [.8, .2])
+    train_size = int(0.75 * len(data))
+    train_data, test_data = random_split(data, [train_size, len(data) - train_size])
 
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
-    model = resnet50()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = load_model()
+    model.to(device)
 
-    n_features = model.fc.in_features
-    model.fc = Linear(n_features, 2)
-    model.load_state_dict(torch.load('trained_classification_model.pth'))
-
-    loss_func = CrossEntropyLoss()
-    optimizer = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=l2)
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=l2)
 
     best_loss = float('inf')
-    patience = 10
+    patience = 100
     triggers = 0
 
     for epoch in range(max_epochs):
         print(f'Epoch {epoch + 1}')
-        train_loop(train_loader, model, loss_func, optimizer)
-        loss, accuracy = test_loop(test_loader, model, loss_func)
-
-        print(f'Loss: {loss} | Accuracy: {accuracy}')
+        train_loop(train_loader, model, optimizer, device)
+        loss = test_loop(test_loader, model, device)
 
         if loss < best_loss:
             best_loss = loss
             triggers = 0
 
-            torch.save(model.state_dict(), 'trained_model.pth')
+            torch.save(model.state_dict(), 'Classifier_50.pth')
         else:
             triggers += 1
 
