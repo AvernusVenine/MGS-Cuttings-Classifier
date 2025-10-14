@@ -1,6 +1,6 @@
 # MGS Cuttings Classifier
 
-A [ResNet](https://pytorch.org/hub/pytorch_vision_resnet/) model used to automatically classify drill cuttings.
+An adapted [FasterRCNN](https://docs.pytorch.org/vision/master/models/faster_rcnn.html) based model used to detect and classify grains in cuttings taken from drill samples.
 
-All data needs to be in the form of a singular grain or as sets of 6, as seen in example_photo.jpg.
-If data is in that form, it must be divided using the function divide_dataset() found in image_preprocessor.py
+## Data Collection
+For data collection, download the 
