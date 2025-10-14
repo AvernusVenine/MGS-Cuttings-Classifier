@@ -1,31 +1,16 @@
 import sys
-import tempfile
-import time
-from pathlib import Path
-
+import datetime
 import cv2
 import numpy as np
 import torch
-from PIL import Image
-from Stats import threshold
-from torch.nn import CrossEntropyLoss, Linear
-from torchvision.models import resnet50
-import torchvision.transforms as T
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from PyQt6.QtWidgets import QWidget, QMenuBar, QMainWindow, QApplication, QToolBar, QComboBox, QGraphicsPixmapItem, \
-    QGraphicsScene, QGraphicsView, QDoubleSpinBox, QVBoxLayout, QLabel, QHBoxLayout
-from PyQt6.QtCore import QSize, Qt, QObject, QEvent, QTimer, pyqtSignal, QThread, QRectF, QCoreApplication
-from PyQt6.QtGui import QAction, QIcon, QKeySequence, QImage, QPixmap, QPainter, QFont, QPen, QColor
+from PyQt6.QtWidgets import QWidget, QMainWindow, QApplication, QComboBox, QGraphicsPixmapItem, \
+    QGraphicsScene, QGraphicsView, QVBoxLayout, QLabel, QHBoxLayout, QPushButton
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, QCoreApplication
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QFont, QPen, QColor, QKeyEvent
 from pygrabber.dshow_graph import FilterGraph
-import torch.nn.functional as F
-
-import ClassificationModel
 import FasterRCNNModel
-from DetectionModel import DetectionCNN
-import dataset
-import ImagePreprocessor
-from dataset import GrainLabel
 
 class DetectionWorker(QObject):
     boxes_ready = pyqtSignal(list)
@@ -176,6 +161,7 @@ class CameraWorker(QObject):
         self.boxes = boxes
 
 class AppWindow(QMainWindow):
+    save_path = 'P:/qdi/tate_grain_data'
 
     def __init__(self, model, device):
         super().__init__()
@@ -184,7 +170,9 @@ class AppWindow(QMainWindow):
         self.device = device
 
         self.grain_images = []
+        self.grain_labels = {}
         self.grain_index = 0
+        self.grain_frozen = False
 
         self.setWindowTitle('MGS Grain Annotator')
 
@@ -228,16 +216,78 @@ class AppWindow(QMainWindow):
         self.grains_pixmap = QGraphicsPixmapItem()
         self.grains_scene.addItem(self.grains_pixmap)
 
+        self.freeze_button =  QPushButton('Freeze')
+        self.freeze_button.clicked.connect(self.update_frozen)
+
+        index_layout = QHBoxLayout()
+
+        self.left_button = QPushButton('←')
+        self.left_button.clicked.connect(self.grain_index_left)
+        self.right_button = QPushButton('→')
+        self.right_button.clicked.connect(self.grain_index_right)
+
+        index_layout.addWidget(self.left_button)
+        index_layout.addWidget(self.right_button)
+
+        self.grain_combobox = QComboBox()
+        grain_list = ['felsic', 'quartzite', 'clear_quartz', 'mafic_igneous', 'metased_volcanic',
+                      'iron_formation', 'red_volcanic', 'arkosic', 'quartz_arenite', 'precambrian_other',
+                      'carbonate', 'paleozoic_sandstone', 'paleozoic_shale', 'dark_limestone', 'inoceramus', 'gray_shale',
+                      'speckled_shale', 'pyrite', 'lignite', 'ostrander_sand', 'cretaceous_other',
+                      'chert', 'secondary', 'gypsum', 'paleozoic_other', 'other']
+        grain_list.sort()
+        self.grain_combobox.addItems(grain_list)
+        self.grain_combobox.setCurrentIndex(-1)
+        self.grain_combobox.currentIndexChanged.connect(self.change_grain_label)
+
+        self.grain_save_button = QPushButton('Save Grains')
+        self.grain_save_button.clicked.connect(self.save_grains)
+
         grain_layout.addWidget(self.grain_index_label)
         grain_layout.addWidget(self.grains_view)
+        grain_layout.addWidget(self.freeze_button)
+        grain_layout.addLayout(index_layout)
+        grain_layout.addWidget(self.grain_combobox)
+        grain_layout.addWidget(self.grain_save_button)
 
         layout.addWidget(self.view, stretch=4)
         layout.addLayout(grain_layout, stretch=1)
 
         central_widget.setLayout(layout)
 
+        self.grain_save_button.hide()
+        self.grain_combobox.hide()
+
         self.setCentralWidget(central_widget)
         self.resize(960 + 240, 540)
+
+    def save_grains(self):
+        date = datetime.datetime.now()
+        date = int(date.strftime('%Y%m%d%H%M%S'))
+
+        for idx, image in enumerate(self.grain_images):
+            if idx in self.grain_labels:
+                try:
+                    label = self.grain_labels[idx]
+                    if label == '' or label is None:
+                        continue
+                    image.save(f'{self.save_path}/{self.grain_labels[idx]}/{date}{idx}.jpg')
+                except:
+                    print('Failed to save grain image!')
+
+        self.update_frozen()
+
+    def change_grain_label(self, idx):
+        if idx == -1:
+            return
+
+        self.grain_labels[self.grain_index] = self.grain_combobox.currentText()
+
+    def grain_index_right(self):
+        self.change_grain_index(1)
+
+    def grain_index_left(self):
+        self.change_grain_index(-1)
 
     def change_grain_index(self, delta : int):
         if len(self.grain_images) == 0:
@@ -256,7 +306,14 @@ class AppWindow(QMainWindow):
         self.grain_index = new_idx
         self.grain_index_label.setText(f'Grain {self.grain_index}')
 
+        self.grain_combobox.setCurrentIndex(-1)
+
+        if self.grain_index in self.grain_labels:
+            self.grain_combobox.setCurrentText(self.grain_labels[self.grain_index])
+
     def update_grain_images(self, grains):
+        if self.grain_frozen:
+            return
         self.grain_images = grains
         self.change_grain_index(0)
 
@@ -264,10 +321,33 @@ class AppWindow(QMainWindow):
         self.pixmap_item.setPixmap(QPixmap.fromImage(image))
         self.view.fitInView(self.pixmap_item)
 
+    def update_frozen(self):
+        self.grain_frozen = ~self.grain_frozen
+
+        if self.grain_frozen:
+            self.grain_combobox.show()
+            self.grain_save_button.show()
+            self.freeze_button.setText('Unfreeze')
+        else:
+            self.grain_combobox.hide()
+            self.grain_save_button.hide()
+            self.freeze_button.setText('Freeze')
+            self.change_grain_index(-self.grain_index)
+            self.grain_labels = {}
+
+    def keyPressEvent(self, event):
+        if isinstance(event, QKeyEvent):
+            if event.key() == 16777236:
+                self.change_grain_index(1)
+            elif event.key() == 16777234:
+                self.change_grain_index(-1)
+            elif event.key() == 32:
+                self.update_frozen()
+
 def run():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    detection_model = FasterRCNNModel.load_model(path='Trained Models/FasterRCNN_256_256.pth')
+    detection_model = FasterRCNNModel.load_model(path='FasterRCNN_256_256.pth')
     detection_model.to(device)
     detection_model.eval()
 
@@ -276,4 +356,5 @@ def run():
     window.show()
     sys.exit(app.exec())
 
-run()
+if __name__ == "__main__":
+    run()
